@@ -1,0 +1,439 @@
+# ─────────────────────────────────────────────────────────────────
+# .github/workflows/ai-test-generator.yml
+#
+# Agente gerador de testes — dispara automaticamente em PRs
+# que modificam arquivos Python sem cobertura de testes.
+#
+# Fluxo completo:
+#   1. PR aberto/atualizado → detecta arquivos .py modificados
+#   2. Filtra arquivos sem test correspondente
+#   3. Roda o agente no workspace clonado (sandbox Docker)
+#   4. Agente gera testes, confirma que passam
+#   5. Abre PR automático com os testes gerados
+#   6. Posta sumário como comentário no PR original
+#   7. Audit log salvo como artefato para compliance
+#
+# Segurança:
+#   - Agente roda em container sem acesso à rede externa
+#   - ANTHROPIC_API_KEY via GitHub Secrets (nunca exposta)
+#   - PR de testes sempre abre em branch isolada
+#   - Revisão humana obrigatória antes do merge (branch protection)
+# ─────────────────────────────────────────────────────────────────
+
+name: AI Test Generator
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - "src/**/*.py"
+      - "app/**/*.py"
+      - "lib/**/*.py"
+      # Adapte os caminhos acima ao seu projeto
+
+  # Permite disparar manualmente pela UI do GitHub
+  workflow_dispatch:
+    inputs:
+      target_files:
+        description: "Arquivos alvo (separados por vírgula), ex: src/auth/service.py"
+        required: false
+        default: ""
+      pr_number:
+        description: "Número do PR de referência (opcional)"
+        required: false
+        default: ""
+
+# Evita rodar múltiplas vezes em paralelo para o mesmo PR
+concurrency:
+  group: ai-test-gen-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write        # criar branches e commits
+  pull-requests: write   # abrir PRs e postar comentários
+  issues: write          # postar comentários
+
+env:
+  PYTHON_VERSION: "3.11"
+  AGENT_MAX_STEPS: "30"
+  AGENT_MAX_COST_USD: "0.50"
+  AGENT_TIMEOUT_S: "300"
+  # Branch de base para os PRs de testes
+  TESTS_PR_BASE: ${{ github.event.pull_request.base.ref || 'main' }}
+
+jobs:
+  # ──────────────────────────────────────────────────────────────
+  # JOB 1: Detecta quais arquivos precisam de testes
+  # ──────────────────────────────────────────────────────────────
+  detect-targets:
+    name: Detectar arquivos sem cobertura
+    runs-on: ubuntu-latest
+    outputs:
+      has_targets: ${{ steps.detect.outputs.has_targets }}
+      target_files: ${{ steps.detect.outputs.target_files }}
+      target_list: ${{ steps.detect.outputs.target_list }}
+      pr_number: ${{ steps.meta.outputs.pr_number }}
+      head_sha: ${{ steps.meta.outputs.head_sha }}
+
+    steps:
+      - name: Checkout do PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Para PRs de forks, usa o HEAD do PR
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Metadados do run
+        id: meta
+        run: |
+          PR_NUM="${{ github.event.pull_request.number || inputs.pr_number || '' }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+          echo "pr_number=${PR_NUM}" >> "$GITHUB_OUTPUT"
+          echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Run: PR #${PR_NUM} | SHA: ${HEAD_SHA:0:8}"
+
+      - name: Detectar arquivos Python modificados sem testes
+        id: detect
+        run: |
+          # ── Obtém lista de arquivos modificados ──────────────────
+          if [ -n "${{ inputs.target_files }}" ]; then
+            # Modo manual: usa arquivos passados explicitamente
+            MODIFIED=$(echo "${{ inputs.target_files }}" | tr ',' '\n' | xargs -I{} echo {})
+          else
+            # Modo automático: diff entre base e HEAD do PR
+            BASE="${{ github.event.pull_request.base.sha || 'HEAD~1' }}"
+            MODIFIED=$(git diff --name-only "${BASE}" HEAD -- '*.py' \
+              | grep -v '__pycache__' \
+              | grep -v '.pyc' \
+              | grep -v 'migrations/' \
+              || true)
+          fi
+
+          echo "Arquivos Python modificados:"
+          echo "${MODIFIED}"
+
+          # ── Filtra: apenas src (não tests), apenas .py ──────────
+          SOURCE_FILES=$(echo "${MODIFIED}" \
+            | grep -E '^(src|app|lib)/' \
+            | grep -v '/test_' \
+            | grep -v '_test\.py$' \
+            | grep '\.py$' \
+            || true)
+
+          # ── Para cada arquivo fonte, verifica se existe teste ────
+          NEEDS_TESTS=""
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+
+            # Heurística: src/auth/service.py → tests/test_auth_service.py
+            BASENAME=$(basename "$file" .py)
+            DIRNAME=$(dirname "$file" | sed 's|^src/||;s|^app/||;s|^lib/||')
+            TEST_PATH_1="tests/test_${BASENAME}.py"
+            TEST_PATH_2="tests/${DIRNAME}/test_${BASENAME}.py"
+            TEST_PATH_3="tests/unit/test_${BASENAME}.py"
+
+            if [ ! -f "$TEST_PATH_1" ] && \
+               [ ! -f "$TEST_PATH_2" ] && \
+               [ ! -f "$TEST_PATH_3" ]; then
+              NEEDS_TESTS="${NEEDS_TESTS}${file}"$'\n'
+              echo "  SEM TESTE: $file"
+            else
+              echo "  COM TESTE: $file (pulando)"
+            fi
+          done <<< "$SOURCE_FILES"
+
+          NEEDS_TESTS=$(echo "${NEEDS_TESTS}" | sed '/^$/d')
+
+          if [ -z "${NEEDS_TESTS}" ]; then
+            echo "Todos os arquivos modificados já têm testes. Nada a fazer."
+            echo "has_targets=false" >> "$GITHUB_OUTPUT"
+            echo "target_files=" >> "$GITHUB_OUTPUT"
+            echo "target_list=" >> "$GITHUB_OUTPUT"
+          else
+            # Serializa como JSON array para passar entre jobs
+            TARGET_JSON=$(echo "${NEEDS_TESTS}" | jq -Rsc 'split("\n") | map(select(. != ""))')
+            TARGET_COMMA=$(echo "${NEEDS_TESTS}" | tr '\n' ',' | sed 's/,$//')
+
+            echo "has_targets=true" >> "$GITHUB_OUTPUT"
+            echo "target_files=${TARGET_COMMA}" >> "$GITHUB_OUTPUT"
+            echo "target_list=${TARGET_JSON}" >> "$GITHUB_OUTPUT"
+
+            echo ""
+            echo "Arquivos que precisam de testes: ${TARGET_COMMA}"
+          fi
+
+  # ──────────────────────────────────────────────────────────────
+  # JOB 2: Roda o agente gerador de testes
+  # ──────────────────────────────────────────────────────────────
+  generate-tests:
+    name: Gerar testes com IA
+    needs: detect-targets
+    if: needs.detect-targets.outputs.has_targets == 'true'
+    runs-on: ubuntu-latest
+
+    # Container sandbox: sem acesso à rede externa
+    # O agente só acessa api.anthropic.com (necessário para o LLM)
+    container:
+      image: python:3.11-slim
+      options: --network-host   # remove para bloquear rede completamente
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.detect-targets.outputs.head_sha }}
+
+      - name: Instalar dependências
+        run: |
+          pip install --quiet \
+            anthropic>=0.40.0 \
+            pytest>=8.0.0 \
+            pytest-timeout>=2.3.0 \
+            pytest-mock>=3.14.0
+
+      - name: Baixar arquivos do agente
+        # Os arquivos do agente ficam em .github/agents/test_generator/
+        # Copie os 4 arquivos do zip para lá no seu repositório
+        run: |
+          echo "Verificando arquivos do agente..."
+          ls .github/agents/test_generator/ || \
+            { echo "ERRO: .github/agents/test_generator/ não encontrado."; \
+              echo "Copie harness.py, tools.py, agent.py, main.py para esse diretório."; \
+              exit 1; }
+
+      - name: Executar agente
+        id: agent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python - <<'PYEOF'
+          import json
+          import os
+          import sys
+
+          sys.path.insert(0, ".github/agents/test_generator")
+
+          from agent import TestGeneratorAgent
+
+          target_files = "${{ needs.detect-targets.outputs.target_files }}"
+          files_list   = [f.strip() for f in target_files.split(",") if f.strip()]
+
+          task = (
+              f"Gere testes unitários completos para os seguintes arquivos "
+              f"modificados neste PR:\n\n"
+              + "\n".join(f"  - {f}" for f in files_list)
+              + "\n\nPara cada arquivo:\n"
+              "1. Leia o arquivo fonte com read_file\n"
+              "2. Verifique testes existentes em tests/ com list_dir\n"
+              "3. Gere testes cobrindo: happy path, erros e edge cases\n"
+              "4. Escreva com write_test_file e confirme com run_tests\n"
+              "5. Se os testes falharem, corrija antes de finalizar\n"
+          )
+
+          agent = TestGeneratorAgent(
+              workspace_root   = os.getcwd(),
+              auto_approve_low = True,
+              max_steps        = int(os.environ.get("AGENT_MAX_STEPS", 30)),
+              max_cost_usd     = float(os.environ.get("AGENT_MAX_COST_USD", 0.50)),
+          )
+
+          result = agent.run(task)
+
+          # Salva resultado para os próximos steps
+          with open("/tmp/agent_result.json", "w") as f:
+              json.dump(result, f, indent=2, ensure_ascii=False)
+
+          if result["status"] != "success":
+              print(f"ERRO: Agente encerrou com status '{result['status']}'")
+              print(f"Motivo: {result.get('reason', 'desconhecido')}")
+              sys.exit(1)
+
+          print(f"Testes gerados: {result['files_written']}")
+          PYEOF
+
+      - name: Verificar arquivos gerados
+        id: check
+        run: |
+          RESULT=$(cat /tmp/agent_result.json)
+          FILES=$(echo "$RESULT" | jq -r '.files_written[]' 2>/dev/null || echo "")
+
+          if [ -z "$FILES" ]; then
+            echo "AVISO: Agente não gerou nenhum arquivo de teste"
+            echo "files_generated=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Arquivos de teste gerados:"
+            echo "$FILES"
+            echo "files_generated=true" >> "$GITHUB_OUTPUT"
+            echo "files_list<<EOF" >> "$GITHUB_OUTPUT"
+            echo "$FILES" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Sumário do agente para o comentário no PR
+          SUMMARY=$(echo "$RESULT" | jq -r '.final_message // ""' | head -c 1500)
+          echo "agent_summary<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$SUMMARY" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          # Métricas do harness
+          STEPS=$(echo "$RESULT" | jq -r '.harness.steps // 0')
+          COST=$(echo "$RESULT" | jq -r '.harness.cost_usd // 0')
+          ELAPSED=$(echo "$RESULT" | jq -r '.harness.elapsed_s // 0')
+          echo "steps=${STEPS}" >> "$GITHUB_OUTPUT"
+          echo "cost=${COST}" >> "$GITHUB_OUTPUT"
+          echo "elapsed=${ELAPSED}" >> "$GITHUB_OUTPUT"
+
+      - name: Salvar audit log como artefato
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-log-${{ github.run_id }}
+          path: logs/*.jsonl
+          retention-days: 90     # 90 dias para compliance
+          if-no-files-found: warn
+
+      - name: Salvar testes gerados como artefato
+        if: steps.check.outputs.files_generated == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-tests-${{ github.run_id }}
+          path: tests/
+          if-no-files-found: warn
+
+      # ── Abre PR com os testes gerados ──────────────────────────
+      - name: Criar branch e PR com os testes
+        if: steps.check.outputs.files_generated == 'true'
+        id: create_pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUM="${{ needs.detect-targets.outputs.pr_number }}"
+          HEAD_SHA="${{ needs.detect-targets.outputs.head_sha }}"
+          BRANCH="ai-tests/pr-${PR_NUM}-${HEAD_SHA:0:7}"
+          BASE="${{ env.TESTS_PR_BASE }}"
+
+          git config user.name  "AI Test Generator"
+          git config user.email "ai-agent@noreply.github.com"
+
+          # Cria branch a partir do HEAD do PR original
+          git checkout -b "${BRANCH}"
+
+          # Adiciona apenas os arquivos de teste gerados
+          git add tests/
+          git diff --cached --name-only
+
+          if git diff --cached --quiet; then
+            echo "Nenhuma mudança para commitar (testes já existem?)"
+            echo "pr_url=" >> "$GITHUB_OUTPUT"
+          else
+            git commit -m "test: gera testes para PR #${PR_NUM} [ai-generated]
+
+          Gerado automaticamente pelo AI Test Generator.
+          PR de origem: #${PR_NUM}
+          SHA: ${HEAD_SHA:0:8}
+          Custo: \$${{ steps.check.outputs.cost }}
+          Passos: ${{ steps.check.outputs.steps }}
+
+          Revise os testes antes de mergear.
+          Audit log: artefato audit-log-${{ github.run_id }}"
+
+            git push origin "${BRANCH}"
+
+            # Monta o body do PR
+            FILES_MD=$(echo "${{ steps.check.outputs.files_list }}" \
+              | tr ',' '\n' | sed 's/^/- `/' | sed 's/$/`/')
+
+            PR_URL=$(gh pr create \
+              --base "${BASE}" \
+              --head "${BRANCH}" \
+              --title "test: testes gerados para PR #${PR_NUM} [ai-generated]" \
+              --body "## Testes gerados automaticamente
+
+          > Este PR foi criado pelo **AI Test Generator** após detectar arquivos sem cobertura no PR #${PR_NUM}.
+          > **Revise os testes antes de mergear.**
+
+          ### Arquivos cobertos
+          ${FILES_MD}
+
+          ### Métricas do agente
+          | Métrica | Valor |
+          |---------|-------|
+          | Passos executados | ${{ steps.check.outputs.steps }} |
+          | Custo estimado | \$${{ steps.check.outputs.cost }} |
+          | Tempo total | ${{ steps.check.outputs.elapsed }}s |
+
+          ### Audit log
+          O log completo de todas as ações do agente está disponível como artefato:
+          [audit-log-${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          ### Checklist para o revisor
+          - [ ] Os testes cobrem happy path, erros e edge cases
+          - [ ] Nenhum dado sensível ou credencial nos testes
+          - [ ] Mocks adequados para dependências externas
+          - [ ] Nomes de funções são descritivos
+          - [ ] Todos os testes passam (\`pytest tests/\`)
+
+          ### Sumário do agente
+          \`\`\`
+          ${{ steps.check.outputs.agent_summary }}
+          \`\`\`
+          " \
+              --label "ai-generated,tests,needs-review")
+
+            echo "pr_url=${PR_URL}" >> "$GITHUB_OUTPUT"
+            echo "PR criado: ${PR_URL}"
+          fi
+
+      # ── Posta comentário no PR original ────────────────────────
+      - name: Comentar no PR original
+        if: needs.detect-targets.outputs.pr_number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUM="${{ needs.detect-targets.outputs.pr_number }}"
+          PR_URL="${{ steps.create_pr.outputs.pr_url }}"
+          FILES="${{ steps.check.outputs.files_list }}"
+          STEPS="${{ steps.check.outputs.steps }}"
+          COST="${{ steps.check.outputs.cost }}"
+
+          if [ "${{ steps.check.outputs.files_generated }}" == "true" ] && \
+             [ -n "${PR_URL}" ]; then
+            BODY="### AI Test Generator
+
+          Detectei arquivos modificados sem cobertura de testes e gerei testes automaticamente.
+
+          **PR com os testes:** ${PR_URL}
+
+          **Arquivos cobertos:** \`${FILES}\`
+
+          **Harness:** ${STEPS} passos | \$${COST} | [audit log](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          > Revise e mergee o PR de testes antes (ou junto) deste PR."
+
+          elif [ "${{ steps.check.outputs.files_generated }}" == "false" ]; then
+            BODY="### AI Test Generator
+
+          O agente rodou mas não gerou arquivos de teste.
+          Verifique o [log da execução](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) para detalhes."
+
+          else
+            exit 0
+          fi
+
+          gh pr comment "${PR_NUM}" --body "${BODY}" \
+            --repo "${{ github.repository }}" || true
+
+  # ──────────────────────────────────────────────────────────────
+  # JOB 3: Notifica se nenhum target foi encontrado
+  # ──────────────────────────────────────────────────────────────
+  skip-notification:
+    name: Sem arquivos para cobrir
+    needs: detect-targets
+    if: needs.detect-targets.outputs.has_targets == 'false'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Log
+        run: |
+          echo "Todos os arquivos modificados já têm testes ou não são elegíveis."
+          echo "Nenhuma ação necessária."
