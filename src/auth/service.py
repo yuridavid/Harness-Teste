@@ -31,7 +31,7 @@ class AuthService:
     def hash_password(self, password: str) -> str:
         """Gera o hash seguro de uma senha."""
         if not password:
-            raise ValueError("Senha n�o pode ser vazia")
+            raise ValueError("Senha nao pode ser vazia")
         if len(password) < 8:
             raise ValueError("Senha deve ter pelo menos 8 caracteres")
         return hmac.new(
