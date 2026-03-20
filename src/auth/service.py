@@ -1,5 +1,5 @@
 """
-src/auth/service.py — Serviço de autenticação
+src/auth/service.py Servico de autenticacao
 """
 import hashlib
 import hmac
@@ -20,7 +20,7 @@ class AuthError(Exception):
 
 
 class AuthService:
-    """Serviço de autenticação de usuários."""
+    """Servico de autenticacacao de usuarios."""
 
     def __init__(self, secret_key: str):
         if not secret_key or len(secret_key) < 16:
@@ -31,7 +31,7 @@ class AuthService:
     def hash_password(self, password: str) -> str:
         """Gera o hash seguro de uma senha."""
         if not password:
-            raise ValueError("Senha não pode ser vazia")
+            raise ValueError("Senha nï¿½o pode ser vazia")
         if len(password) < 8:
             raise ValueError("Senha deve ter pelo menos 8 caracteres")
         return hmac.new(
@@ -41,11 +41,11 @@ class AuthService:
         ).hexdigest()
 
     def register(self, username: str, password: str) -> User:
-        """Registra um novo usuário."""
+        """Registra um novo usuï¿½rio."""
         if not username or not username.strip():
-            raise ValueError("Username não pode ser vazio")
+            raise ValueError("Username nï¿½o pode ser vazio")
         if username in self._users:
-            raise AuthError(f"Username '{username}' já está em uso")
+            raise AuthError(f"Username '{username}' jï¿½ estï¿½ em uso")
         user = User(
             id            = len(self._users) + 1,
             username      = username.strip(),
@@ -56,8 +56,8 @@ class AuthService:
 
     def login(self, username: str, password: str) -> Optional[User]:
         """
-        Autentica um usuário.
-        Retorna o User se as credenciais forem válidas, None caso contrário.
+        Autentica um usuï¿½rio.
+        Retorna o User se as credenciais forem vï¿½lidas, None caso contrï¿½rio.
         """
         user = self._users.get(username)
         if user is None:
@@ -70,7 +70,7 @@ class AuthService:
         return user
 
     def deactivate(self, username: str) -> bool:
-        """Desativa uma conta de usuário. Retorna True se encontrou o usuário."""
+        """Desativa uma conta de usuï¿½rio. Retorna True se encontrou o usuï¿½rio."""
         user = self._users.get(username)
         if user is None:
             return False
