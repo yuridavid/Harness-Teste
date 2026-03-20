@@ -1,0 +1,155 @@
+# ─────────────────────────────────────────────────────────────────
+# .github/workflows/ai-tests-quality-gate.yml
+#
+# Quality gate: roda nos PRs de testes gerados pela IA.
+# Garante que os testes passam e faz análise de segurança
+# antes de permitir o merge.
+# ─────────────────────────────────────────────────────────────────
+
+name: AI Tests Quality Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    branches:
+      - main
+      - develop
+    paths:
+      - "tests/**"
+
+jobs:
+  quality-gate:
+    name: Validar testes gerados pela IA
+    runs-on: ubuntu-latest
+
+    # Só roda em PRs marcados como ai-generated
+    # (evita rodar em PRs humanos comuns)
+    if: |
+      contains(github.event.pull_request.labels.*.name, 'ai-generated') ||
+      startsWith(github.event.pull_request.head.ref, 'ai-tests/')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Instalar dependências
+        run: |
+          pip install pytest pytest-timeout pytest-mock pytest-cov
+          # Instala dependências do projeto se existir requirements.txt
+          [ -f requirements.txt ] && pip install -r requirements.txt || true
+          [ -f requirements-dev.txt ] && pip install -r requirements-dev.txt || true
+
+      - name: Detectar arquivos de teste gerados por IA
+        id: detect
+        run: |
+          # Pega apenas arquivos de tests/ modificados no PR
+          BASE="${{ github.event.pull_request.base.sha }}"
+          FILES=$(git diff --name-only "${BASE}" HEAD -- 'tests/*.py' 'tests/**/*.py' || true)
+          echo "files=${FILES}" >> "$GITHUB_OUTPUT"
+          echo "Arquivos de teste para validar:"
+          echo "${FILES}"
+
+      - name: Rodar testes com cobertura
+        id: pytest
+        run: |
+          python -m pytest tests/ \
+            --tb=short \
+            --no-header \
+            -q \
+            --timeout=60 \
+            --cov=src \
+            --cov-report=term-missing \
+            --cov-report=json:/tmp/coverage.json \
+            2>&1 | tee /tmp/pytest_output.txt
+
+          EXIT_CODE=${PIPESTATUS[0]}
+          echo "exit_code=${EXIT_CODE}" >> "$GITHUB_OUTPUT"
+
+          # Extrai métricas de cobertura
+          COVERAGE=$(python -c "
+          import json
+          with open('/tmp/coverage.json') as f:
+            data = json.load(f)
+          print(f\"{data['totals']['percent_covered']:.1f}\")
+          " 2>/dev/null || echo "0")
+          echo "coverage=${COVERAGE}" >> "$GITHUB_OUTPUT"
+
+      - name: Análise de segurança dos testes (Semgrep)
+        id: security
+        continue-on-error: true
+        run: |
+          pip install --quiet semgrep
+          semgrep scan \
+            --config=auto \
+            --include="tests/" \
+            --severity=ERROR \
+            --json \
+            --output=/tmp/semgrep.json \
+            . 2>/dev/null || true
+
+          FINDINGS=$(python -c "
+          import json
+          try:
+            with open('/tmp/semgrep.json') as f:
+              data = json.load(f)
+            count = len(data.get('results', []))
+            print(count)
+          except:
+            print(0)
+          ")
+          echo "security_findings=${FINDINGS}" >> "$GITHUB_OUTPUT"
+          echo "Findings de segurança: ${FINDINGS}"
+
+      - name: Postar resultado como comentário
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          EXIT_CODE="${{ steps.pytest.outputs.exit_code }}"
+          COVERAGE="${{ steps.pytest.outputs.coverage }}"
+          FINDINGS="${{ steps.security.outputs.security_findings }}"
+          PYTEST_OUT=$(cat /tmp/pytest_output.txt | tail -20)
+
+          if [ "${EXIT_CODE}" == "0" ]; then
+            STATUS="✅ Todos os testes passando"
+            BADGE="success"
+          else
+            STATUS="❌ Testes falhando — revise antes de mergear"
+            BADGE="failure"
+          fi
+
+          BODY="### Quality Gate — Testes gerados por IA
+
+          **Status:** ${STATUS}
+          **Cobertura:** ${COVERAGE}%
+          **Findings de segurança (Semgrep):** ${FINDINGS}
+
+          <details>
+          <summary>Output do pytest</summary>
+
+          \`\`\`
+          ${PYTEST_OUT}
+          \`\`\`
+          </details>
+          "
+
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --body "${BODY}" \
+            --repo "${{ github.repository }}" || true
+
+      - name: Falhar se testes não passam
+        if: steps.pytest.outputs.exit_code != '0'
+        run: |
+          echo "Os testes gerados pelo agente não estão passando."
+          echo "Verifique o output acima e corrija antes de mergear."
+          exit 1
+
+      - name: Falhar se há findings críticos de segurança
+        if: steps.security.outputs.security_findings != '0'
+        run: |
+          echo "Foram encontrados ${FINDINGS} problemas de segurança nos testes gerados."
+          echo "Revise o output do Semgrep antes de mergear."
+          exit 1
