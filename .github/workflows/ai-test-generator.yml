@@ -26,16 +26,15 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
     paths:
-      - "src/**/*.py"
-      - "app/**/*.py"
-      - "lib/**/*.py"
+      - "src/auth/*.py"
+
       # Adapte os caminhos acima ao seu projeto
 
   # Permite disparar manualmente pela UI do GitHub
   workflow_dispatch:
     inputs:
       target_files:
-        description: "Arquivos alvo (separados por vírgula), ex: src/auth/service.py"
+        description: "src/auth/service.py"
         required: false
         default: ""
       pr_number:
@@ -114,7 +113,7 @@ jobs:
 
           # ── Filtra: apenas src (não tests), apenas .py ──────────
           SOURCE_FILES=$(echo "${MODIFIED}" \
-            | grep -E '^(src|app|lib)/' \
+            | grep -E 'src/' \
             | grep -v '/test_' \
             | grep -v '_test\.py$' \
             | grep '\.py$' \
